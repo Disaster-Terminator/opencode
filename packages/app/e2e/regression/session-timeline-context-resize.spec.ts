@@ -1,4 +1,13 @@
-import { expect, test, type Page, type Route } from "@playwright/test"
+import { expect, test, type Page } from "@playwright/test"
+import { mockOpenCodeServer } from "../utils/mock-server"
+import { expectAppVisible, expectSessionTitle } from "../utils/waits"
+import {
+  analyzeVisualObservations,
+  defineVisualRegions,
+  startVisualProbe,
+  stopVisualProbe,
+  visualPlan,
+} from "../utils/visual-stability"
 
 const directory = "C:/OpenCode/ContextResizeRegression"
 const projectID = "proj_context_resize_regression"
@@ -22,19 +31,93 @@ test.describe("regression: session timeline context group resize", () => {
     await configurePage(page)
 
     await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
-    await expect(page.getByRole("heading", { name: title })).toBeVisible()
-    await expect(page.locator(`[data-timeline-part-ids="${contextIDs.join(",")}"]`).first()).toBeVisible()
-    await expect(page.locator(`[data-timeline-part-id="${followingTextID}"]`).first()).toBeVisible()
+    await expectSessionTitle(page, title)
+    await expectAppVisible(page.locator(`[data-timeline-part-ids="${contextIDs.join(",")}"]`).first())
+    await expectAppVisible(page.locator(`[data-timeline-part-id="${followingTextID}"]`).first())
     await settle(page)
 
     const samples = await sampleExpansion(page)
     const visibleOverlap = samples.filter((sample) => sample.frame >= 1 && sample.overlap > 0.5)
 
-    console.log("context resize samples", JSON.stringify(samples, null, 2))
-
     expect(samples[0]?.overlap).toBe(0)
     expect(visibleOverlap).toEqual([])
     expect(samples.at(-1)?.expanded).toBe("true")
+  })
+
+  test("paints a stable exploring to explored transition", async ({ page }) => {
+    const events: { directory: string; payload: Record<string, unknown> }[] = []
+    await page.setViewportSize({ width: 1400, height: 900 })
+    await mockServer(page, events, [
+      ...Array.from({ length: 8 }, (_, index) => turn(index, false)).flat(),
+      ...turn(10, true, "running"),
+    ])
+    await configurePage(page)
+
+    await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+    await expectSessionTitle(page, title)
+    const devtools = await page.context().newCDPSession(page)
+    await devtools.send("Emulation.setCPUThrottlingRate", { rate: 4 })
+    const context = page.locator(`[data-timeline-part-ids="${contextIDs.join(",")}"]`).first()
+    await expectAppVisible(context)
+    await expect(context.locator('[data-component="tool-status-title"]')).toHaveAttribute("aria-label", "Exploring")
+
+    const contextSelector = `[data-timeline-part-ids="${contextIDs.join(",")}"]`
+    const regions = defineVisualRegions({
+      status: {
+        selector: `${contextSelector} [data-component="tool-status-title"]`,
+        opacitySelectors: ['[data-slot="tool-status-active"]', '[data-slot="tool-status-done"]'],
+      },
+      context: { selector: contextSelector, closest: '[data-timeline-row="AssistantPart"]' },
+      following: {
+        selector: `[data-timeline-part-id="${followingTextID}"]`,
+        closest: '[data-timeline-row="AssistantPart"]',
+      },
+    })
+    await startVisualProbe(page, regions)
+    for (const [index, delay] of [120, 350, 80, 500].entries()) {
+      events.push({
+        directory,
+        payload: {
+          type: "message.part.updated",
+          properties: {
+            part: contextTool(
+              contextIDs[index]!,
+              id("msg_assistant", 10),
+              ["read", "glob", "grep", "list"][index]!,
+              [
+                { filePath: "src/recent-a.ts" },
+                { path: directory, pattern: "**/*.ts" },
+                { path: directory, pattern: "Explored" },
+                { path: "src" },
+              ][index]!,
+            ),
+          },
+        },
+      })
+      await page.waitForTimeout(delay)
+    }
+
+    await expect(context.locator('[data-component="tool-status-title"]')).toHaveAttribute("aria-label", "Explored")
+    await page.waitForTimeout(700)
+    const trace = await stopVisualProbe<keyof typeof regions>(page)
+    const labels = trace.samples
+      .map((sample) => sample.regions.status?.label)
+      .filter((value): value is string => !!value)
+      .filter((value, index, all) => value !== all[index - 1])
+    const issues = analyzeVisualObservations(
+      trace.samples,
+      visualPlan(regions, [
+        { type: "required", regions: ["context", "following"] },
+        { type: "opacity", regions: "all" },
+        { type: "continuity", regions: "all" },
+        { type: "motion", regions: "all" },
+        { type: "label-stability", regions: "all" },
+        { type: "flow", regions: ["context", "following"] },
+      ]),
+    )
+
+    expect(labels).toEqual(["Exploring", "Explored"])
+    expect(issues, JSON.stringify(trace.samples, null, 2)).toEqual([])
   })
 })
 
@@ -47,7 +130,6 @@ async function configurePage(page: Page) {
           editToolPartsExpanded: true,
           shellToolPartsExpanded: true,
           showReasoningSummaries: true,
-          showSessionProgressBar: true,
         },
       }),
     )
@@ -113,13 +195,15 @@ async function sampleExpansion(page: Page) {
 
         let frame = 1
         const tick = () => {
-          capture(frame, "raf")
-          frame += 1
-          if (frame > 8) {
-            resolve(samples)
-            return
-          }
-          requestAnimationFrame(tick)
+          setTimeout(() => {
+            capture(frame, "painted")
+            frame += 1
+            if (frame > 8) {
+              resolve(samples)
+              return
+            }
+            requestAnimationFrame(tick)
+          }, 0)
         }
         requestAnimationFrame(tick)
       }),
@@ -127,7 +211,7 @@ async function sampleExpansion(page: Page) {
   )
 }
 
-function turn(index: number, target: boolean): Message[] {
+function turn(index: number, target: boolean, status: "running" | "completed" = "completed"): Message[] {
   const userID = id("msg_user", index)
   const assistantID = id("msg_assistant", index)
   return [
@@ -162,10 +246,22 @@ function turn(index: number, target: boolean): Message[] {
       },
       parts: target
         ? [
-            contextTool(contextIDs[0]!, assistantID, "read", { filePath: "src/recent-a.ts", offset: 0, limit: 120 }),
-            contextTool(contextIDs[1]!, assistantID, "glob", { path: directory, pattern: "**/*.ts" }),
-            contextTool(contextIDs[2]!, assistantID, "grep", { path: directory, pattern: "Explored", include: "*.ts" }),
-            contextTool(contextIDs[3]!, assistantID, "list", { path: "src" }),
+            contextTool(
+              contextIDs[0]!,
+              assistantID,
+              "read",
+              { filePath: "src/recent-a.ts", offset: 0, limit: 120 },
+              status,
+            ),
+            contextTool(contextIDs[1]!, assistantID, "glob", { path: directory, pattern: "**/*.ts" }, status),
+            contextTool(
+              contextIDs[2]!,
+              assistantID,
+              "grep",
+              { path: directory, pattern: "Explored", include: "*.ts" },
+              status,
+            ),
+            contextTool(contextIDs[3]!, assistantID, "list", { path: "src" }, status),
             {
               id: followingTextID,
               sessionID,
@@ -187,7 +283,13 @@ function turn(index: number, target: boolean): Message[] {
   ]
 }
 
-function contextTool(partID: string, messageID: string, tool: string, input: Record<string, unknown>) {
+function contextTool(
+  partID: string,
+  messageID: string,
+  tool: string,
+  input: Record<string, unknown>,
+  status: "running" | "completed" = "completed",
+) {
   return {
     id: partID,
     sessionID,
@@ -196,7 +298,7 @@ function contextTool(partID: string, messageID: string, tool: string, input: Rec
     callID: `call_${partID}`,
     tool,
     state: {
-      status: "completed",
+      status,
       input,
       output: `Completed ${tool}.\n${"detail line\n".repeat(8)}`,
       title: input.filePath || input.path || input.pattern || "completed",
@@ -206,34 +308,19 @@ function contextTool(partID: string, messageID: string, tool: string, input: Rec
   }
 }
 
-async function mockServer(page: Page) {
-  await page.route("**/*", async (route) => {
-    const url = new URL(route.request().url())
-    const targetPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
-    if (url.port !== targetPort) return route.fallback()
-
-    const path = url.pathname
-    if (path === "/global/event" || path === "/event") return sse(route)
-    if (["/global/config", "/config", "/provider/auth", "/mcp", "/session/status"].includes(path))
-      return json(route, {})
-    if (
-      ["/skill", "/command", "/lsp", "/formatter", "/permission", "/question", "/vcs/status", "/vcs/diff"].includes(
-        path,
-      )
-    )
-      return json(route, [])
-    if (path === "/provider") return json(route, provider())
-    if (path === "/path")
-      return json(route, { state: directory, config: directory, worktree: directory, directory, home: "C:/OpenCode" })
-    if (path === "/project") return json(route, [project()])
-    if (path === "/project/current") return json(route, project())
-    if (path === "/agent") return json(route, [{ name: "build", mode: "primary" }])
-    if (path === "/vcs") return json(route, { branch: "main", default_branch: "main" })
-    if (path === "/session") return json(route, [session()])
-    if (path === `/session/${sessionID}`) return json(route, session())
-    if (/^\/session\/[^/]+\/(children|todo|diff)$/.test(path)) return json(route, [])
-    if (path === `/session/${sessionID}/message`) return json(route, messages)
-    return json(route, {})
+async function mockServer(
+  page: Page,
+  events: { directory: string; payload: Record<string, unknown> }[] = [],
+  fixtureMessages = messages,
+) {
+  await mockOpenCodeServer(page, {
+    directory,
+    project: project(),
+    provider: provider(),
+    sessions: [session()],
+    pageMessages: () => ({ items: fixtureMessages }),
+    events: () => events.splice(0, 1),
+    eventRetry: 50,
   })
 }
 
@@ -280,19 +367,6 @@ function provider() {
     connected: ["opencode"],
     default: { providerID: "opencode", modelID: "claude-opus-4-6" },
   }
-}
-
-function json(route: Route, body: unknown, headers?: Record<string, string>) {
-  return route.fulfill({
-    status: 200,
-    contentType: "application/json",
-    headers: { "access-control-allow-origin": "*", "access-control-expose-headers": "x-next-cursor", ...headers },
-    body: JSON.stringify(body ?? null),
-  })
-}
-
-function sse(route: Route) {
-  return route.fulfill({ status: 200, contentType: "text/event-stream", body: ": ok\n\n" })
 }
 
 function base64Encode(value: string) {
